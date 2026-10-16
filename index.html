@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Crystal Alchemy</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; color: white;}
+        #ui {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            background: radial-gradient(circle, #1a1a3a 0%, #000 100%); z-index: 100;
+        }
+        .upload-btn {
+            position: relative; overflow: hidden; display: inline-block;
+            padding: 20px 40px; background: linear-gradient(45deg, #0055ff, #00d4ff);
+            color: white; font-size: 24px; font-weight: bold; border-radius: 50px;
+            cursor: pointer; transition: transform 0.2s; box-shadow: 0 0 30px rgba(0, 212, 255, 0.6);
+        }
+        .upload-btn:hover { transform: scale(1.05); }
+        .upload-btn input[type=file] {
+            font-size: 100px; position: absolute; left: 0; top: 0; opacity: 0; cursor: pointer;
+        }
+        #instructions { margin-top: 30px; text-align: center; line-height: 1.8; color: #ccc; }
+        #loading { display: none; margin-top: 20px; font-size: 20px; color: #00d4ff; }
+        
+        #hud {
+            position: absolute; top: 10px; width: 100%; text-align: center;
+            pointer-events: none; z-index: 50; display: none; text-shadow: 0 0 5px #000; font-size: 18px;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <h1>Crystal Alchemy: The Blueprint</h1>
+        <div class="upload-btn">
+            <span>MP3 파일 선택하여 의식 시작</span>
+            <input type="file" id="audioInput" accept="audio/*">
+        </div>
+        <div id="loading">오디오 분석 중... 잠시만 기다려주세요.</div>
+        <div id="instructions">
+            <strong>[조작 방법]</strong><br>
+            <strong>PC:</strong> [좌클릭] = 180도 공중 분산 토글 / [우클릭] = 가루 파편 폭발 토글<br>
+            <strong>VR 기기:</strong> [왼쪽 트리거] = 180도 분산 / [오른쪽 트리거] = 가루 폭발
+        </div>
+    </div>
+
+    <div id="hud">PC: 마우스 드래그로 회전 | 좌클릭: 분산 / 우클릭: 폭발 (현재 상태: CLUSTER)</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        let scene, camera, renderer, controls;
+        let audioCtx, analyser, dataArray;
+        
+        // 상태 관리
+        // 'CLUSTER'(중앙 밀집), 'DISPERSED'(180도 분산), 'SHATTERED'(가루 폭발)
+        let currentState = 'CLUSTER'; 
+        
+        // 수정 기둥(InstancedMesh) 변수
+        const CRYSTAL_COUNT = 200;
+        let crystalMesh, dummy;
+        let currentPos = [], currentQuat = [];
+        let clusterPos = [], clusterQuat = [];
+        let dispersePos = [], disperseQuat = [];
+
+        // 가루/파편(Points) 변수
+        let particleSystem;
+        const PARTICLE_COUNT = 20000; // 수정 하나당 100개의 가루
+        let pPositions, pVelocities;
+        
+        // 컨트롤러 상태 추적용
+        let leftTriggerPressed = false;
+        let rightTriggerPressed = false;
+
+        const clock = new THREE.Clock();
+
+        initThreeJS();
+
+        // --- MP3 파일 로드 ---
+        document.getElementById('audioInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            document.getElementById('loading').style.display = 'block';
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                initAudio(e.target.result);
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        function initAudio(arrayBuffer) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx.decodeAudioData(arrayBuffer, function(buffer) {
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                source.connect(analyser);
+                analyser.connect(audioCtx.destination);
+                source.loop = true;
+                source.start(0);
+                
+                document.getElementById('ui').style.display = 'none';
+                document.getElementById('hud').style.display = 'block';
+                document.body.appendChild(VRButton.createButton(renderer));
+                
+                animate();
+            });
+        }
+
+        function initThreeJS() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000511, 0.05);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 1.6, 1); 
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            
+            // 시각적 퀄리티를 위한 톤매핑
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.2;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 1.5, -3);
+            controls.enableDamping = true;
+
+            // 조명 (수정을 빛나게 함)
+            const ambientLight = new THREE.AmbientLight(0x224488, 1.0);
+            scene.add(ambientLight);
+            const pointLight = new THREE.PointLight(0x00aaff, 5, 20);
+            pointLight.position.set(0, 2, -2);
+            scene.add(pointLight);
+
+            dummy = new THREE.Object3D();
+
+            createCrystals();
+            createParticles();
+
+            // PC 마우스 컨트롤 (우클릭 메뉴 방지)
+            window.addEventListener('contextmenu', (e) => e.preventDefault());
+            
+            window.addEventListener('mousedown', (e) => {
+                if (e.button === 0) { // 좌클릭: 분산 토글
+                    toggleDisperse();
+                } else if (e.button === 2) { // 우클릭: 폭발 토글
+                    toggleShatter();
+                }
+            });
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- 1. 수정 기둥 시스템 (InstancedMesh) 생성 ---
+        function createCrystals() {
+            // 다이아몬드/수정 형태 생성 (Octahedron을 길게 늘림)
+            const geometry = new THREE.OctahedronGeometry(0.3, 0);
+            geometry.scale(0.8, 4.0, 0.8); // 위아래로 뾰족하게
+
+            // 푸른색 크리스탈 재질
+            const material = new THREE.MeshStandardMaterial({
+                color: 0x1144aa,
+                emissive: 0x001133,
+                roughness: 0.1,
+                metalness: 0.8,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            crystalMesh = new THREE.InstancedMesh(geometry, material, CRYSTAL_COUNT);
+            scene.add(crystalMesh);
+
+            const centerPoint = new THREE.Vector3(0, 1.5, -4); // 중앙 밀집 기준점
+
+            for (let i = 0; i < CRYSTAL_COUNT; i++) {
+                // 1) Cluster (중앙 밀집 상태) 계산
+                const phi = Math.acos(-1 + (2 * i) / CRYSTAL_COUNT);
+                const theta = Math.sqrt(CRYSTAL_COUNT * Math.PI) * phi;
+                
+                // 구형(Sphere) 표면에 배치
+                let r = 1.0 + Math.random() * 0.5;
+                let cx = r * Math.cos(theta) * Math.sin(phi);
+                let cy = r * Math.sin(theta) * Math.sin(phi);
+                let cz = r * Math.cos(phi);
+                
+                const cPos = new THREE.Vector3(cx, cy, cz).add(centerPoint);
+                clusterPos.push(cPos);
+
+                // 바깥을 향해 뾰족하게 회전
+                dummy.position.copy(centerPoint);
+                dummy.lookAt(cPos);
+                dummy.rotateX(Math.PI / 2); // 뾰족한 부분이 밖을 향하게
+                clusterQuat.push(dummy.quaternion.clone());
+
+                // 2) Disperse (180도 전면 분산 상태) 계산
+                // 관찰자 앞(Z가 마이너스) 방향 반원 배치
+                const angle = (Math.random() - 0.5) * Math.PI; // -90도 ~ 90도 (앞쪽 180도)
+                const radius = 3 + Math.random() * 4; // 거리 3~7
+                const height = 0.5 + Math.random() * 3.5; // 공중에 떠있는 높이
+
+                const dPos = new THREE.Vector3(
+                    Math.sin(angle) * radius,
+                    height,
+                    -Math.cos(angle) * radius
+                );
+                dispersePos.push(dPos);
+                
+                // 각자 공중에서 무작위 방향으로 둥둥 떠있는 회전
+                dummy.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+                disperseQuat.push(dummy.quaternion.clone());
+
+                // 초기 위치를 Cluster로 설정
+                currentPos.push(cPos.clone());
+                currentQuat.push(dummy.quaternion.clone());
+            }
+        }
+
+        // --- 2. 가루/파편 시스템 (Points) 생성 ---
+        function createParticles() {
+            const geo = new THREE.BufferGeometry();
+            pPositions = new Float32Array(PARTICLE_COUNT * 3);
+            pVelocities = new Float32Array(PARTICLE_COUNT * 3);
+            
+            geo.setAttribute('position', new THREE.BufferAttribute(pPositions, 3));
+            
+            const mat = new THREE.PointsMaterial({
+                color: 0x00d4ff, size: 0.05,
+                transparent: true, opacity: 0.8,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particleSystem = new THREE.Points(geo, mat);
+            particleSystem.visible = false; // 평소엔 숨김
+            scene.add(particleSystem);
+        }
+
+        // --- 3. 상태 변경 토글 함수 ---
+        function toggleDisperse() {
+            if (currentState === 'SHATTERED') return; // 부서진 상태면 무시
+            
+            if (currentState === 'CLUSTER') {
+                currentState = 'DISPERSED';
+            } else {
+                currentState = 'CLUSTER';
+            }
+            updateHUD();
+        }
+
+        function toggleShatter() {
+            if (currentState !== 'SHATTERED') {
+                currentState = 'SHATTERED';
+                crystalMesh.visible = false;
+                particleSystem.visible = true;
+                
+                // 현재 수정들의 위치를 기반으로 가루 폭발 세팅
+                for (let i = 0; i < CRYSTAL_COUNT; i++) {
+                    const basePos = currentPos[i];
+                    for (let j = 0; j < 100; j++) {
+                        const idx = (i * 100 + j) * 3;
+                        pPositions[idx] = basePos.x + (Math.random()-0.5)*0.5;
+                        pPositions[idx+1] = basePos.y + (Math.random()-0.5)*0.5;
+                        pPositions[idx+2] = basePos.z + (Math.random()-0.5)*0.5;
+                        
+                        // 사방으로 뻗어나가는 폭발력
+                        pVelocities[idx] = (Math.random() - 0.5) * 15.0;
+                        pVelocities[idx+1] = (Math.random() - 0.5) * 15.0;
+                        pVelocities[idx+2] = (Math.random() - 0.5) * 15.0;
+                    }
+                }
+            } else {
+                // 모이기 (다시 수정 형태로 복원)
+                currentState = 'CLUSTER';
+                crystalMesh.visible = true;
+                particleSystem.visible = false;
+            }
+            updateHUD();
+        }
+
+        function updateHUD() {
+            document.getElementById('hud').innerText = `PC: 마우스 드래그로 회전 | 좌클릭: 180도 분산 / 우클릭: 폭발 (현재 상태: ${currentState})`;
+        }
+
+        // VR 게임패드 입력을 통한 좌우 트리거 감지
+        function handleGamepadInput() {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+            
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                const triggerValue = source.gamepad.buttons[0].value;
+                
+                if (source.handedness === 'left') {
+                    if (triggerValue > 0.5 && !leftTriggerPressed) {
+                        leftTriggerPressed = true;
+                        toggleDisperse();
+                    } else if (triggerValue < 0.1) {
+                        leftTriggerPressed = false;
+                    }
+                } else if (source.handedness === 'right') {
+                    if (triggerValue > 0.5 && !rightTriggerPressed) {
+                        rightTriggerPressed = true;
+                        toggleShatter();
+                    } else if (triggerValue < 0.1) {
+                        rightTriggerPressed = false;
+                    }
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        // --- 핵심 애니메이션 루프 ---
+        function render() {
+            const delta = Math.min(clock.getDelta(), 0.1);
+            const time = clock.getElapsedTime();
+
+            controls.update();
+            handleGamepadInput();
+
+            let audioIntensity = 0;
+            if (analyser) {
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for(let i=0; i<30; i++) sum += dataArray[i]; // 베이스 영역
+                audioIntensity = sum / (30 * 255);
+            }
+
+            // [상태 1 & 2] 수정 기둥들의 부드러운 위치 이동 (Lerp)
+            if (crystalMesh.visible) {
+                for (let i = 0; i < CRYSTAL_COUNT; i++) {
+                    const tPos = (currentState === 'CLUSTER') ? clusterPos[i] : dispersePos[i];
+                    const tQuat = (currentState === 'CLUSTER') ? clusterQuat[i] : disperseQuat[i];
+
+                    // 부드럽게 목표 위치로 이동
+                    currentPos[i].lerp(tPos, delta * 3.0);
+                    currentQuat[i].slerp(tQuat, delta * 3.0);
+
+                    dummy.position.copy(currentPos[i]);
+                    dummy.quaternion.copy(currentQuat[i]);
+                    
+                    // 오디오에 따른 미세 진동 및 크기 펌핑
+                    const scale = 1.0 + audioIntensity * 0.5;
+                    dummy.scale.set(scale, scale, scale);
+                    
+                    // 분산 상태일 때는 개별적으로 천천히 회전하며 둥둥 떠있게 함
+                    if (currentState === 'DISPERSED') {
+                        dummy.position.y += Math.sin(time * 2 + i) * 0.02; 
+                        dummy.rotateY(delta * 0.5);
+                        currentQuat[i].copy(dummy.quaternion); // 회전값 누적 저장
+                    }
+
+                    dummy.updateMatrix();
+                    crystalMesh.setMatrixAt(i, dummy.matrix);
+                    
+                    // 소리에 맞춰 수정의 색상(발광) 변화
+                    const color = new THREE.Color();
+                    color.setHSL(0.6, 0.9, 0.2 + (audioIntensity * 0.6));
+                    crystalMesh.setColorAt(i, color);
+                }
+                crystalMesh.instanceMatrix.needsUpdate = true;
+                if(crystalMesh.instanceColor) crystalMesh.instanceColor.needsUpdate = true;
+            }
+
+            // [상태 3] 폭발 가루 물리 연산
+            if (particleSystem.visible) {
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    let idx = i * 3;
+                    
+                    pPositions[idx] += pVelocities[idx] * delta;
+                    pPositions[idx+1] += pVelocities[idx+1] * delta;
+                    pPositions[idx+2] += pVelocities[idx+2] * delta;
+                    
+                    // 마찰력 및 중력 약간 적용
+                    pVelocities[idx] *= 0.95;
+                    pVelocities[idx+1] -= 0.1; // 살짝 떨어짐
+                    pVelocities[idx+2] *= 0.95;
+                    
+                    // 오디오에 맞춰 파편들이 진동
+                    if (audioIntensity > 0.6) {
+                        pVelocities[idx] += (Math.random() - 0.5) * 5.0;
+                    }
+                }
+                particleSystem.geometry.attributes.position.needsUpdate = true;
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
